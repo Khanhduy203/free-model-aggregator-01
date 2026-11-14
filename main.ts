@@ -92,6 +92,11 @@ const callsMade = new Map<string, number>();
 /** Failures seen this trial, by provider id. Two failures deprioritise a provider: one failure is
  * usually a scheduled one-off (every provider has 1-2), but two mean an outage or a spent budget. */
 const failureCounts = new Map<string, number>();
+/** Providers whose error answer said the failure is permanent (a spent budget or an outage):
+ * every later call to one refuses, so the router never calls one again this trial. A provider
+ * whose error said only that the call was refused stays usable: a scheduled failure fails only
+ * its own call number. */
+const deadProviders = new Set<string>();
 
 /** Whether a provider has failed twice and is deprioritised for the rest of the trial. */
 function isDeprioritised(providerId: string): boolean {
@@ -197,12 +202,24 @@ function models(req: IncomingMessage, res: ServerResponse): void {
   else sendJson(res, 200, openAIModelList(list));
 }
 
+/** One upstream call's outcome: an answer, or a failure marked permanent when the provider's
+ * own error answer says its budget is spent or it is out (every later call refuses too). */
+type UpstreamResult = { ok: true; answer: NormalizedAnswer } | { ok: false; dead: boolean };
+
+/** The error message of a provider's refusal, in whichever wire's envelope carried it. */
+function errorMessage(body: unknown): string {
+  if (!isRecord(body)) return '';
+  const error = body.error;
+  if (!isRecord(error)) return '';
+  return typeof error.message === 'string' ? error.message : '';
+}
+
 /**
  * One inference call to one provider, in its own wire. The client wire decides the translation;
- * the upstream call is always non-streaming JSON. Returns the normalized answer, or null with the
- * failure logged when the provider refuses or the answer is not parseable.
+ * the upstream call is always non-streaming JSON. Returns the normalized answer, or the failure
+ * with `dead` set when the provider's error answer says the failure is permanent.
  */
-async function callUpstream(candidate: Candidate, clientApi: 'openai' | 'anthropic', body: Json): Promise<NormalizedAnswer | null> {
+async function callUpstream(candidate: Candidate, clientApi: 'openai' | 'anthropic', body: Json): Promise<UpstreamResult> {
   const provider = candidate.probe.provider;
   const base = joinBase(ENV_URL, provider.base);
   const headers: Record<string, string> = {
@@ -227,46 +244,53 @@ async function callUpstream(candidate: Candidate, clientApi: 'openai' | 'anthrop
     res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
   } catch (err) {
     log(`upstream ${provider.id}/${candidate.model.id} unreachable: ${(err as Error).message}`);
-    return null;
+    return { ok: false, dead: false };
   }
   if (!res.ok) {
-    log(`upstream ${provider.id}/${candidate.model.id} answered HTTP ${res.status}`);
+    let dead = false;
     try {
-      await res.text();
+      const text = await res.text();
+      const message = errorMessage(JSON.parse(text));
+      // A spent budget or an outage refuses every later call; a refused call refuses only itself.
+      dead = message.includes('budget is spent') || message.includes(' is out');
+      log(`upstream ${provider.id}/${candidate.model.id} answered HTTP ${res.status}${dead ? ' (permanent)' : ''}: ${message.slice(0, 120)}`);
     } catch {
-      // The body is not needed; the status is the failure.
+      log(`upstream ${provider.id}/${candidate.model.id} answered HTTP ${res.status}`);
     }
-    return null;
+    return { ok: false, dead };
   }
   let answer: unknown;
   try {
     answer = await res.json();
   } catch {
     log(`upstream ${provider.id}/${candidate.model.id} answered a body that is not JSON`);
-    return null;
+    return { ok: false, dead: false };
   }
   if (!isRecord(answer)) {
     log(`upstream ${provider.id}/${candidate.model.id} answered a JSON value that is not one object`);
-    return null;
+    return { ok: false, dead: false };
   }
-  if (provider.wire === 'openai') return parseOpenAIAnswer(answer);
-  if (provider.wire === 'anthropic') return parseAnthropicAnswer(answer);
-  return parseGeminiAnswer(answer);
+  const parsed =
+    provider.wire === 'openai' ? parseOpenAIAnswer(answer) : provider.wire === 'anthropic' ? parseAnthropicAnswer(answer) : parseGeminiAnswer(answer);
+  return parsed === null ? { ok: false, dead: false } : { ok: true, answer: parsed };
 }
 
 /**
  * Serve one client request: the planned candidate first (when it is still eligible for the live
- * body and its provider has not failed twice), then the failover order — untouched providers
- * first, then providers that have never failed twice, then deprioritised ones. A failed call is
- * never retried on the same provider: a scheduled failure fails only its own call, but two often
- * sit side by side, so a retry can fail twice where a failover to an untouched provider answers
- * at once. Returns the answer and the candidate that served it, or null when no candidate answered.
+ * body, its provider is neither dead nor twice-failed), then the failover order — untouched
+ * providers first, then providers that have never failed twice, then deprioritised ones. A
+ * provider that fails during this request is not tried again for it while any untried candidate
+ * on another provider remains: a failure is provider-level (a scheduled fail, an outage or a
+ * spent budget), so another model on the same provider usually fails too, where a failover to
+ * an untouched provider answers at once. A provider the error answer called dead is never
+ * tried again at all. Returns the answer and the candidate that served it, or null when no
+ * candidate answered.
  */
 async function serve(clientApi: 'openai' | 'anthropic', body: Json): Promise<{ answer: NormalizedAnswer; candidate: Candidate } | null> {
   const index = manifestIndex;
   manifestIndex += 1;
   const requires = requirementsFor(index, body);
-  const eligible = candidatesFor(probes, brief.ratings, requires, clientApi, body);
+  const eligible = candidatesFor(probes, brief.ratings, requires, clientApi, body).filter((c) => !deadProviders.has(c.probe.provider.id));
   if (eligible.length === 0) return null;
 
   const tried = new Set<string>();
@@ -279,12 +303,23 @@ async function serve(clientApi: 'openai' | 'anthropic', body: Json): Promise<{ a
     attempts.push(next);
   }
 
-  for (const candidate of attempts.slice(0, MAX_ATTEMPTS)) {
+  // Providers that failed during this request: skipped while another provider remains untried.
+  const failedHere = new Set<string>();
+  const remaining = attempts.slice(0, MAX_ATTEMPTS);
+  let made = 0;
+  while (remaining.length > 0 && made < MAX_ATTEMPTS) {
+    let at = remaining.findIndex((c) => !failedHere.has(c.probe.provider.id));
+    if (at === -1) at = remaining.findIndex((c) => !deadProviders.has(c.probe.provider.id));
+    if (at === -1) break; // Only dead providers remain: no further call can answer.
+    const candidate = remaining.splice(at, 1)[0]!;
     tried.add(keyOf(candidate));
+    made += 1;
     callsMade.set(candidate.probe.provider.id, (callsMade.get(candidate.probe.provider.id) ?? 0) + 1);
-    const answer = await callUpstream(candidate, clientApi, body);
-    if (answer !== null) return { answer, candidate };
+    const result = await callUpstream(candidate, clientApi, body);
+    if (result.ok) return { answer: result.answer, candidate };
+    failedHere.add(candidate.probe.provider.id);
     failureCounts.set(candidate.probe.provider.id, (failureCounts.get(candidate.probe.provider.id) ?? 0) + 1);
+    if (result.dead) deadProviders.add(candidate.probe.provider.id);
   }
   return null;
 }

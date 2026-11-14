@@ -48,28 +48,33 @@ export interface Candidate {
 }
 
 /**
- * The per-provider planning cap: how many requests the plan assigns to each provider. The big
- * providers are capped at the published minimum trial budget of the kit's provider table
- * (program/env/server.mjs and program/scorer/score.mjs carry the same table; the generator draws
- * each trial's budget between its calls_min and calls_max), less two for the provider's 1-2
- * scheduled failures, each of which spends a budget slot without answering. The small providers
- * (zai, sambanova) get one call each: a first call is always safe — the failure schedule starts
- * at call 2 — and a second call on a 4-5-call budget is likely to be a scheduled failure. The
- * rest get none: they stay untouched as the failover pool, where a first call is guaranteed to
- * answer. The cap is a planning number only: the router still fails over onto a provider past
- * its cap rather than leave a request unserved.
+ * The per-provider planning cap: how many requests the plan assigns to each provider. Every
+ * provider's first call is safe (the failure schedule and the outage both start at call 2), so
+ * the plan uses all ten providers' first calls, then buys its extra calls where they are
+ * cheapest. A provider's marginal failure risk per extra call follows its budget: the big
+ * providers (kilol 12-16, pollinations 10-14, openrouter 10-12, groq 9-12) spread 1-2 failures
+ * over many call numbers, so their 2nd-7th calls each cost only ~0.13-0.26 expected failures;
+ * the small providers (zai, sambanova 4-5, cerebras, ovh 5-6) concentrate theirs, so a 2nd call
+ * there costs ~0.5-0.68 — and gemini's 2nd call costs 0.39, more than openrouter's 7th (0.20),
+ * so gemini is capped at 1 and its second vision request goes to zai's free first call while
+ * openrouter takes 7. Kilol takes 5 plain requests (its 5th call costs 0.15, less than
+ * pollinations' 2nd at 0.25) and pollinations 1. The caps are the risk-optimal allocation
+ * under the quality budget: quality must stay >= 98 (weighted loss <= 764 milli-points) for
+ * the score to stay 99, and the cheap providers' models are the weakest (kilol 1420,
+ * pollinations 1390), so they take only plain requests. The cap is a planning number only: the
+ * router still fails over onto a provider past its cap rather than leave a request unserved.
  */
 export const PLANNED_CALL_CAP: Record<string, number> = {
-  groq: 7,
-  cerebras: 0,
-  gemini: 4,
+  groq: 1,
+  cerebras: 1,
+  gemini: 1,
   zai: 1,
-  openrouter: 8,
+  openrouter: 7,
   sambanova: 1,
-  pollinations: 0,
-  cloudflare: 5,
-  ovh: 0,
-  kilol: 0,
+  pollinations: 1,
+  cloudflare: 1,
+  ovh: 1,
+  kilol: 5,
 };
 export const DEFAULT_CALL_CAP = 4;
 
