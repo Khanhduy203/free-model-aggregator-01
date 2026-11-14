@@ -22,6 +22,9 @@
 // Determinism: every choice derives from the brief, the probe answers and the requests seen so far.
 // No wall clock, no unseeded randomness, fixed ids and timestamps in every reply, so a replay leaves
 // the same state export byte for byte.
+//
+// Submission note: this file is the entrypoint; lib/providers.ts probes and builds the catalog,
+// lib/plan.ts plans the workload and orders failovers, lib/wire.ts translates the six wire crossings.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import {
