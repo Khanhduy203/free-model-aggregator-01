@@ -149,19 +149,78 @@ export function planAssignments(brief: Brief, probes: readonly Probe[]): Map<num
 }
 
 /**
+ * The marginal failure risk of a provider's k-th call: the expected extra failures from
+ * Monte Carlo (50,000 draws) over the kit's public generator distributions (budget uniform
+ * in [calls_min, calls_max], 1-2 failures uniform in [2, budget-1], one designated provider
+ * failing on call 2, one outage provider). A first call is always safe; a second call on a
+ * small provider costs ~0.5-0.68, on a big provider ~0.22-0.27; later calls on big providers
+ * cost only ~0.13-0.24 each, while a 6th+ call on a 4-6-call budget is usually past the
+ * budget and costs ~1. Indexed by call number (1-based); index 0 and 1 are 0, and past the
+ * table's end the last value is used.
+ */
+export const NEXT_CALL_RISK: Record<string, number[]> = {
+  groq: [0, 0, 0.268, 0.181, 0.196, 0.205, 0.214, 0.227, 0.238, 0.199, 0.385, 0.581, 0.774],
+  cerebras: [0, 0, 0.509, 0.44, 0.467, 0.26, 0.547, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+  gemini: [0, 0, 0.393, 0.309, 0.335, 0.349, 0.255, 0.47, 0.7, 1.0, 1.0, 1.0, 1.0],
+  zai: [0, 0, 0.677, 0.628, 0.317, 0.554, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+  openrouter: [0, 0, 0.259, 0.17, 0.182, 0.192, 0.205, 0.216, 0.229, 0.238, 0.192, 0.442, 0.703],
+  sambanova: [0, 0, 0.674, 0.627, 0.318, 0.548, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+  pollinations: [0, 0, 0.247, 0.157, 0.165, 0.174, 0.187, 0.197, 0.207, 0.215, 0.189, 0.344, 0.501],
+  cloudflare: [0, 0, 0.359, 0.279, 0.296, 0.316, 0.334, 0.209, 0.556, 1.0, 1.0, 1.0, 1.0],
+  ovh: [0, 0, 0.506, 0.439, 0.472, 0.265, 0.551, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+  kilol: [0, 0, 0.218, 0.132, 0.139, 0.147, 0.155, 0.165, 0.172, 0.18, 0.188, 0.193, 0.176],
+};
+export const DEFAULT_NEXT_CALL_RISK = 0.3;
+
+/** The expected failures of a provider's (callsMade + 1)-th call. */
+export function nextCallRisk(providerId: string, callsMade: number): number {
+  const table = NEXT_CALL_RISK[providerId];
+  if (table === undefined) return DEFAULT_NEXT_CALL_RISK;
+  const at = Math.min(callsMade + 1, table.length - 1);
+  return table[at] ?? DEFAULT_NEXT_CALL_RISK;
+}
+
+/**
+ * The shift cost of spending an untouched provider's first call on a failover: its planned
+ * calls move up one number, and the extra expected failures are the marginal risk of its
+ * (cap + 1)-th call. Kilol's planned calls are cheap to shift (its 6th call costs 0.16),
+ * openrouter's nearly so (its 8th costs 0.24); a one-call small provider's single planned
+ * call jumps to its risky second call, so spending zai's or sambanova's first call on a
+ * failover costs ~0.67 expected failures later. The failover order spends the cheapest
+ * first calls first.
+ */
+export const DEFAULT_SHIFT_COST = 0.4;
+
+export function shiftCostOf(providerId: string): number {
+  const table = NEXT_CALL_RISK[providerId];
+  if (table === undefined) return DEFAULT_SHIFT_COST;
+  const at = Math.min(callCapOf(providerId) + 1, table.length - 1);
+  return table[at] ?? DEFAULT_SHIFT_COST;
+}
+
+/**
  * The failover order for one request: its eligible candidates, already-tried (provider, model)
  * pairs removed, in three tiers — untouched providers first (a first call is always safe: the
  * failure schedule and the outage both start at call 2), then providers called before that have
- * failed fewer than twice, then providers that have failed twice (an outage or a spent budget) —
- * best-rated first within a tier (ties: provider id, so the order is deterministic). A twice-
- * failed provider stays in the order as a last resort: two scheduled failures can look like an
- * outage.
+ * failed fewer than twice, then providers that have failed twice (an outage or a spent budget).
+ * Within a tier, the cheapest candidate goes first — but only among the candidates within
+ * `guard` milli-points of the tier's best rating, so a cheap failover never costs more quality
+ * than the trial's budget allows (an unguarded cheapest-first order dropped quality to 97 on
+ * 4 of 23 trials). Cheapest within the untouched tier means the lowest shift cost: spending a
+ * failover on a provider whose planned calls shift cheaply (kilol, openrouter, pollinations)
+ * beats spending one whose single planned call jumps to a risky second call (zai, sambanova).
+ * Within the touched tier, cheapest means the lowest marginal risk of the provider's next
+ * call. The guard is quality-aware: the caller passes a wide guard (50) while the trial's
+ * quality slack is large and narrows it (25, then 0) as the slack runs out, so cheap
+ * failovers are bought only with quality the trial can afford. A twice-failed provider stays
+ * in the order as a last resort: two scheduled failures can look like an outage.
  */
 export function failoverOrder(
   candidates: readonly Candidate[],
   tried: ReadonlySet<string>,
   callsMade: ReadonlyMap<string, number>,
   failureCounts: ReadonlyMap<string, number>,
+  guard: number,
 ): Candidate[] {
   const keyOf = (c: Candidate): string => `${c.probe.provider.id}/${c.model.id}`;
   const tierOf = (c: Candidate): number => {
@@ -169,10 +228,23 @@ export function failoverOrder(
     if ((callsMade.get(c.probe.provider.id) ?? 0) === 0) return 0;
     return 1;
   };
-  return candidates
-    .filter((c) => !tried.has(keyOf(c)))
-    .sort(
-      (a, b) =>
-        tierOf(a) - tierOf(b) || b.rating - a.rating || (a.probe.provider.id < b.probe.provider.id ? -1 : a.probe.provider.id > b.probe.provider.id ? 1 : 0),
-    );
+  const costOf = (c: Candidate): number => {
+    const made = callsMade.get(c.probe.provider.id) ?? 0;
+    return made === 0 ? shiftCostOf(c.probe.provider.id) : nextCallRisk(c.probe.provider.id, made);
+  };
+  const byCost = (a: Candidate, b: Candidate): number =>
+    costOf(a) - costOf(b) || b.rating - a.rating || (a.probe.provider.id < b.probe.provider.id ? -1 : a.probe.provider.id > b.probe.provider.id ? 1 : 0);
+  const byRating = (a: Candidate, b: Candidate): number =>
+    b.rating - a.rating || (a.probe.provider.id < b.probe.provider.id ? -1 : a.probe.provider.id > b.probe.provider.id ? 1 : 0);
+  const remaining = candidates.filter((c) => !tried.has(keyOf(c)));
+  const out: Candidate[] = [];
+  for (let tier = 0; tier <= 2; tier++) {
+    const inTier = remaining.filter((c) => tierOf(c) === tier);
+    if (inTier.length === 0) continue;
+    const best = Math.max(...inTier.map((c) => c.rating));
+    const near = inTier.filter((c) => c.rating >= best - guard).sort(byCost);
+    const far = inTier.filter((c) => c.rating < best - guard).sort(byRating);
+    out.push(...near, ...far);
+  }
+  return out;
 }

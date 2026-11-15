@@ -87,6 +87,16 @@ const brief = readBrief(PROMPT_FILE);
 let probes: Probe[] = [];
 let catalog: CatalogReport = { providers: [] };
 let plan = new Map<number, Candidate>();
+/** The best eligible rating per manifest request, by index: the scorer's per-request ceiling. */
+let bestRatingByIndex: number[] = [];
+/** The manifest weight per request, by index. */
+let weightByIndex: number[] = [];
+/** The weighted quality loss the trial can afford before quality drops below 98: floor(2% of
+ * the sum of weight x best rating). For this workload 764 milli-points. */
+let qualityBudget = 0;
+/** The weighted quality loss already spent this trial: weight x (best - served rating) per
+ * served request, weight x best per unserved one. */
+let lossSoFar = 0;
 /** How many client API requests have arrived: the manifest is in arrival order, one request at a time. */
 let manifestIndex = 0;
 /** Inference calls made this trial, by provider id: a provider with none is untouched, and its first call cannot fail. */
@@ -105,6 +115,31 @@ function isDeprioritised(providerId: string): boolean {
   return (failureCounts.get(providerId) ?? 0) >= 2;
 }
 
+/**
+ * The failover rating guard for the request now arriving: how many milli-points below the
+ * tier's best rating a cheaper failover candidate may sit. The guard spends quality only
+ * the trial can afford: slack is the quality budget minus the loss already spent minus the
+ * loss the plan still expects from the requests not yet served. Wide (50) while slack is
+ * over 100, narrow (25) while it is over 50, closed (0) below that — at guard 0 the
+ * failover still prefers the cheapest candidate among the tied-best, which costs no
+ * quality at all. A request outside the manifest gets guard 0: no budget is known for it.
+ */
+function guardFor(index: number): number {
+  if (bestRatingByIndex[index] === undefined) return 0;
+  const manifest = brief.workload?.manifest ?? [];
+  let remainingPlannedLoss = 0;
+  for (let j = index; j < manifest.length; j++) {
+    const w = weightByIndex[j] ?? 0;
+    const b = bestRatingByIndex[j] ?? 0;
+    const planned = plan.get(j);
+    remainingPlannedLoss += w * (b - (planned?.rating ?? 0));
+  }
+  const slack = qualityBudget - lossSoFar - remainingPlannedLoss;
+  if (slack > 100) return 50;
+  if (slack > 50) return 25;
+  return 0;
+}
+
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
 }
@@ -116,6 +151,14 @@ async function load(): Promise<void> {
   for (const probe of probes) if (!probe.ok && probe.error !== null) log(probe.error);
   catalog = buildCatalog(ENV_URL, probes, brief.ratings);
   plan = planAssignments(brief, probes);
+  const manifest = brief.workload?.manifest ?? [];
+  bestRatingByIndex = manifest.map((request) => {
+    const cands = candidatesFor(probes, brief.ratings, request.requires, request.api, {});
+    return cands.length > 0 ? cands[0]!.rating : 0;
+  });
+  weightByIndex = manifest.map((request) => request.weight);
+  const bound = manifest.reduce((sum, request, i) => sum + request.weight * (bestRatingByIndex[i] ?? 0), 0);
+  qualityBudget = Math.floor(0.02 * bound);
   log(`planned ${plan.size} of ${brief.workload?.manifest.length ?? 0} requests over ${probes.filter((p) => p.ok).length} providers`);
 }
 
@@ -292,15 +335,20 @@ async function serve(clientApi: 'openai' | 'anthropic', body: Json): Promise<{ a
   const index = manifestIndex;
   manifestIndex += 1;
   const requires = requirementsFor(index, body);
+  const weight = weightByIndex[index] ?? 0;
+  const best = bestRatingByIndex[index] ?? 0;
   const eligible = candidatesFor(probes, brief.ratings, requires, clientApi, body).filter((c) => !deadProviders.has(c.probe.provider.id));
-  if (eligible.length === 0) return null;
+  if (eligible.length === 0) {
+    lossSoFar += weight * best;
+    return null;
+  }
 
   const tried = new Set<string>();
   const keyOf = (c: Candidate): string => `${c.probe.provider.id}/${c.model.id}`;
   const attempts: Candidate[] = [];
   const planned = plan.get(index);
   if (planned !== undefined && !isDeprioritised(planned.probe.provider.id) && eligible.some((c) => keyOf(c) === keyOf(planned))) attempts.push(planned);
-  for (const next of failoverOrder(eligible, tried, callsMade, failureCounts)) {
+  for (const next of failoverOrder(eligible, tried, callsMade, failureCounts, guardFor(index))) {
     if (attempts.some((c) => keyOf(c) === keyOf(next))) continue;
     attempts.push(next);
   }
@@ -318,11 +366,15 @@ async function serve(clientApi: 'openai' | 'anthropic', body: Json): Promise<{ a
     made += 1;
     callsMade.set(candidate.probe.provider.id, (callsMade.get(candidate.probe.provider.id) ?? 0) + 1);
     const result = await callUpstream(candidate, clientApi, body);
-    if (result.ok) return { answer: result.answer, candidate };
+    if (result.ok) {
+      lossSoFar += weight * (best - candidate.rating);
+      return { answer: result.answer, candidate };
+    }
     failedHere.add(candidate.probe.provider.id);
     failureCounts.set(candidate.probe.provider.id, (failureCounts.get(candidate.probe.provider.id) ?? 0) + 1);
     if (result.dead) deadProviders.add(candidate.probe.provider.id);
   }
+  lossSoFar += weight * best;
   return null;
 }
 
