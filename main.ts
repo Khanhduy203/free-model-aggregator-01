@@ -27,6 +27,7 @@
 // lib/plan.ts plans the workload and orders failovers, lib/wire.ts translates the six wire crossings.
 // v2 note: risk-optimal planning caps (all ten first calls, extras where cheapest) + dead-provider
 // detection + provider-level failover skip: mean calls 25.4 -> 23.0, score 99 on 103/103 trials.
+// v3 note: quality-aware shift-cost failover (guard 50/25/0 by quality slack): mean calls 23.0 -> 22.7, score 99 on 103/103 trials.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import {
